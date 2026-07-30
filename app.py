@@ -22,6 +22,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 DB_PATH = DATA_DIR / "pallet_planner.db"
 INITIAL_BASE_PATH = DATA_DIR / "base_inicial.xlsx"
+UNIT_REFERENCE_PATH = DATA_DIR / "cadastro_pracas_uf.csv"
 ASSETS_DIR = APP_DIR / "assets"
 LOGO_PATH = ASSETS_DIR / "bbm-logistica-logo.png"
 FAVICON_PATH = ASSETS_DIR / "bbm-favicon.png"
@@ -464,6 +465,87 @@ def normalize_destination(value: object) -> str:
     if tokens and token_set <= {"FLI", "FL2"}:
         return "FLI/FL2"
     return "/".join(tokens)
+
+
+@st.cache_data(show_spinner=False)
+def load_unit_reference(reference_mtime: float) -> pd.DataFrame:
+    del reference_mtime
+    if not UNIT_REFERENCE_PATH.exists():
+        return pd.DataFrame(columns=["unidade", "uf"])
+    reference = pd.read_csv(UNIT_REFERENCE_PATH, encoding="utf-8-sig")
+    reference["unidade"] = (
+        reference["unidade"].fillna("").astype(str).str.strip().str.upper()
+    )
+    reference["uf"] = reference["uf"].fillna("").astype(str).str.strip().str.upper()
+    return reference[(reference["unidade"] != "") & (reference["uf"] != "")]
+
+
+def get_unit_uf_lookup() -> dict[str, str]:
+    mtime = UNIT_REFERENCE_PATH.stat().st_mtime if UNIT_REFERENCE_PATH.exists() else 0
+    reference = load_unit_reference(mtime)
+    if reference.empty:
+        return {}
+    return (
+        reference.drop_duplicates("unidade", keep="first")
+        .set_index("unidade")["uf"]
+        .to_dict()
+    )
+
+
+def destination_ufs(destination: object, lookup: dict[str, str]) -> tuple[str, ...]:
+    if pd.isna(destination) or str(destination).strip() == "":
+        return ("Não mapeada",)
+    raw = unicodedata.normalize("NFKC", str(destination)).upper()
+    raw = re.sub(r"[\u200B-\u200D\u2060\uFEFF]", "", raw)
+    tokens = [token for token in re.split(r"[\s/\-]+", raw.strip()) if token]
+    ufs = sorted({lookup[token] for token in tokens if token in lookup})
+    return tuple(ufs) if ufs else ("Não mapeada",)
+
+
+def filter_destination_table_by_uf(
+    dataframe: pd.DataFrame,
+    key: str,
+    label: str = "Filtrar por UF",
+) -> tuple[pd.DataFrame, list[str]]:
+    if dataframe.empty or "Praça" not in dataframe.columns:
+        return dataframe.copy(), []
+
+    lookup = get_unit_uf_lookup()
+    output = dataframe.copy()
+    output["_ufs"] = output["Praça"].map(lambda value: destination_ufs(value, lookup))
+    uf_options = sorted(
+        {
+            uf
+            for row_ufs in output["_ufs"]
+            for uf in row_ufs
+            if uf != "Não mapeada"
+        }
+    )
+    if output["_ufs"].map(lambda values: "Não mapeada" in values).any():
+        uf_options.append("Não mapeada")
+
+    selected_ufs = st.multiselect(
+        label,
+        uf_options,
+        default=[],
+        key=key,
+        help=(
+            "Praças agrupadas podem conter unidades de mais de uma UF. Nesses casos, "
+            "a praça aparece ao selecionar qualquer uma das UFs associadas."
+        ),
+    )
+    if selected_ufs:
+        selected_set = set(selected_ufs)
+        output = output[
+            output["_ufs"].map(lambda values: bool(selected_set.intersection(values)))
+        ].copy()
+
+    output.insert(
+        output.columns.get_loc("Praça") + 1,
+        "UF",
+        output["_ufs"].map(lambda values: " / ".join(values)),
+    )
+    return output.drop(columns="_ufs"), selected_ufs
 
 
 def read_uploaded_base(file_or_path: object) -> pd.DataFrame:
@@ -1628,8 +1710,15 @@ def page_forecast_dashboard(loads: pd.DataFrame, destinations: pd.DataFrame) -> 
     if distribution.empty:
         st.warning("Não foi possível reconstruir a distribuição desta previsão.")
     else:
-        display = format_table_br(
+        distribution_view, selected_ufs = filter_destination_table_by_uf(
             distribution,
+            key=f"dashboard_uf_{int(selected['forecast_id'])}",
+        )
+        if distribution_view.empty:
+            st.info("Nenhuma praça corresponde às UFs selecionadas.")
+            return
+        display = format_table_br(
+            distribution_view,
             integer_columns=(
                 "Pallets esperados",
                 "Capacidade recomendada",
@@ -1641,8 +1730,8 @@ def page_forecast_dashboard(loads: pd.DataFrame, destinations: pd.DataFrame) -> 
         )
         st.dataframe(display, hide_index=True, use_container_width=True)
         st.download_button(
-            "Baixar distribuição em CSV",
-            dataframe_to_csv_br(distribution),
+            "Baixar distribuição filtrada em CSV",
+            dataframe_to_csv_br(distribution_view),
             file_name=f"previsao_salva_{selected_date.strftime('%d-%m-%Y')}.csv",
             mime="text/csv",
         )
@@ -1777,13 +1866,26 @@ def page_simulation(loads: pd.DataFrame, destinations: pd.DataFrame) -> None:
     )
 
     distribution = destination_distribution(loads, destinations, comparables, result, parameters)
-    destination_options = ["Todas as praças"]
-    if not distribution.empty:
-        destination_options.extend(sorted(distribution["Praça"].astype(str).unique()))
+    distribution_view, selected_ufs = filter_destination_table_by_uf(
+        distribution,
+        key=f"simulation_uf_filter_{operation_date.isoformat()}",
+    )
+    if selected_ufs and not distribution_view.empty:
+        destination_options = sorted(distribution_view["Praça"].astype(str).unique())
+    else:
+        destination_options = ["Todas as praças"]
+        if not distribution_view.empty:
+            destination_options.extend(
+                sorted(distribution_view["Praça"].astype(str).unique())
+            )
+    destination_key_suffix = "-".join(selected_ufs) if selected_ufs else "todas"
     chart_destination = st.selectbox(
         "Praça exibida nos gráficos",
         destination_options,
-        key="simulation_chart_destination",
+        key=(
+            f"simulation_chart_destination_{operation_date.isoformat()}_"
+            f"{destination_key_suffix}"
+        ),
     )
 
     chart_comparables = comparables
@@ -1834,11 +1936,11 @@ def page_simulation(loads: pd.DataFrame, destinations: pd.DataFrame) -> None:
         ["Distribuição por praça", "Dias comparáveis", "Histórico diário"]
     )
     with tab_distribution:
-        if distribution.empty:
-            st.info("Não há distribuição por praça disponível.")
+        if distribution_view.empty:
+            st.info("Não há distribuição disponível para as UFs selecionadas.")
         else:
             display = format_table_br(
-                distribution,
+                distribution_view,
                 integer_columns=(
                     "Pallets esperados",
                     "Capacidade recomendada",
@@ -1850,8 +1952,8 @@ def page_simulation(loads: pd.DataFrame, destinations: pd.DataFrame) -> None:
             )
             st.dataframe(display, hide_index=True, use_container_width=True)
             st.download_button(
-                "Baixar distribuição em CSV",
-                dataframe_to_csv_br(distribution),
+                "Baixar distribuição filtrada em CSV",
+                dataframe_to_csv_br(distribution_view),
                 file_name=f"distribuicao_pallets_{operation_date.strftime('%d-%m-%Y')}.csv",
                 mime="text/csv",
             )
@@ -2228,6 +2330,10 @@ def page_historical_simulation(loads: pd.DataFrame, destinations: pd.DataFrame) 
         selected_destination = destination_result[
             destination_result["Data"] == selected_date
         ].sort_values("Pallets esperados", ascending=False)
+        selected_destination, _ = filter_destination_table_by_uf(
+            selected_destination,
+            key=f"historical_uf_{selected_date.isoformat()}",
+        )
         selected_destination_display = format_table_br(
             selected_destination,
             date_columns=("Data",),
@@ -2247,9 +2353,9 @@ def page_historical_simulation(loads: pd.DataFrame, destinations: pd.DataFrame) 
             use_container_width=True,
         )
         st.download_button(
-            "Baixar todas as praças em CSV",
-            dataframe_to_csv_br(destination_result, date_columns=("Data",)),
-            file_name="simulacao_historica_por_praca.csv",
+            "Baixar praças filtradas em CSV",
+            dataframe_to_csv_br(selected_destination, date_columns=("Data",)),
+            file_name=f"simulacao_historica_por_praca_{selected_date.strftime('%d-%m-%Y')}.csv",
             mime="text/csv",
         )
 
@@ -2374,6 +2480,10 @@ def page_comparison(loads: pd.DataFrame, destinations: pd.DataFrame) -> None:
         ["Pallets esperados", "Pallets executados"],
         ascending=False,
     )
+    comparison, _ = filter_destination_table_by_uf(
+        comparison,
+        key=f"comparison_uf_{int(selected['forecast_id'])}",
+    )
     comparison_display = format_table_br(
         comparison,
         integer_columns=(
@@ -2470,6 +2580,19 @@ def page_information() -> None:
         "Altere os parâmetros preferencialmente após analisar o Previsto × realizado. "
         "Mudar vários controles ao mesmo tempo dificulta identificar qual ajuste "
         "melhorou ou piorou a estimativa."
+    )
+
+    st.subheader("Filtro por UF")
+    st.write(
+        "A UF é identificada pelo cadastro detalhado das unidades e validada pelo CEP. "
+        "O filtro está disponível no Painel diário, na Simulação diária, na Simulação "
+        "histórica e no Previsto × realizado."
+    )
+    st.caption(
+        "Quando uma praça representa uma rota compartilhada por unidades de estados "
+        "diferentes, ela aparece em todas as UFs associadas. Os pallets continuam sendo "
+        "o total da praça agrupada, pois a base executada não permite separá-los por "
+        "unidade dentro do mesmo agrupamento."
     )
 
 
