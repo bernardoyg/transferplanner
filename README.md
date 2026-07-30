@@ -35,6 +35,8 @@ O logotipo foi obtido no site institucional:
 - média estimada de volumes por pallet específica para cada praça;
 - segmentador de praça nos gráficos da simulação diária, com histórico e dias
   comparáveis específicos da unidade selecionada;
+- filtro multisseleção por UF nas principais visões por praça, usando cadastro
+  de unidades validado pelo CEP;
 - upload incremental da base executada;
 - deduplicação e atualização de carregamentos corrigidos;
 - limpeza de espaços comuns, espaços especiais e caracteres invisíveis nos
